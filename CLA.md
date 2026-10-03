@@ -3,7 +3,7 @@
 **Version: 1.0 — 2026-10-01**
 
 This is the published agreement for the signing process described in
-[the contribution guide](../CONTRIBUTING.md#cla-and-dco). Publication does not sign
+[the contribution guide](CONTRIBUTING.md#cla-and-dco). Publication does not sign
 an agreement for anyone; each Contributor must explicitly accept it, and Lorevia LLC
 must confirm receipt and coverage as described below.
 
@@ -161,5 +161,5 @@ one occasion is not a waiver of future enforcement.
 
 ## How to sign
 
-Follow the [private signing steps](../docs/how-to/sign-contributor-license-agreement.md).
-Maintainers use the separate [verification and record guide](../docs/how-to/manage-contribution-permissions.md).
+Follow the [private signing steps](CONTRIBUTING.md#cla-and-dco).
+Maintainers follow the Project Owner's private verification and record process.
