@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# verify-openconnector — helpers for the project-local verification skill.
+# Drives the hosted commercial product surfaces (marketing, docs, API, console login).
+# This repo does not currently ship a runnable Console/server; do not invent local launch.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+MARKETING_ORIGIN="${OPENCONNECTOR_MARKETING_ORIGIN:-https://openconnector.dev}"
+API_ORIGIN="${OPENCONNECTOR_API_ORIGIN:-https://api.openconnector.dev}"
+APP_ORIGIN="${OPENCONNECTOR_APP_ORIGIN:-https://app.openconnector.dev}"
+
+default_run_id() {
+  date -u +%Y%m%dT%H%M%SZ
+}
+
+RUN_ID="${OPENCONNECTOR_VERIFY_RUN_ID:-$(default_run_id)}"
+WORK_ROOT="${OPENCONNECTOR_VERIFY_ROOT:-/tmp/openconnector-verify-${RUN_ID}}"
+EVIDENCE_DIR="${OPENCONNECTOR_VERIFY_EVIDENCE:-${WORK_ROOT}/evidence}"
+PROFILE_DIR="${OPENCONNECTOR_VERIFY_PROFILE:-${WORK_ROOT}/chrome-profile}"
+PID_FILE="${WORK_ROOT}/chrome.pid"
+META_FILE="${WORK_ROOT}/run.json"
+
+usage() {
+  cat <<'EOF'
+Usage: verify-openconnector <command> [args]
+
+Commands:
+  launch                 Create a disposable run workspace (evidence + chrome profile dirs)
+  doctor                 Read-only health check of hosted commercial surfaces
+  fetch <path-or-url>    GET a URL; write body + headers under evidence/http/
+  screenshot <url> <out> Headless Chrome screenshot (requires google-chrome)
+  drive-integrations     Search integrations for GitHub and open the detail page (HTTP proof)
+  cleanup                Remove scratch profile/workspace; keep evidence/
+  paths                  Print run paths
+
+Environment:
+  OPENCONNECTOR_VERIFY_RUN_ID
+  OPENCONNECTOR_VERIFY_ROOT
+  OPENCONNECTOR_VERIFY_EVIDENCE
+  OPENCONNECTOR_MARKETING_ORIGIN
+  OPENCONNECTOR_API_ORIGIN
+  OPENCONNECTOR_APP_ORIGIN
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "${EVIDENCE_DIR}/http" "${EVIDENCE_DIR}/screenshots" "${EVIDENCE_DIR}/features" "${PROFILE_DIR}"
+}
+
+write_meta() {
+  ensure_dirs
+  cat >"${META_FILE}" <<EOF
+{
+  "runId": "${RUN_ID}",
+  "workRoot": "${WORK_ROOT}",
+  "evidenceDir": "${EVIDENCE_DIR}",
+  "profileDir": "${PROFILE_DIR}",
+  "marketingOrigin": "${MARKETING_ORIGIN}",
+  "apiOrigin": "${API_ORIGIN}",
+  "appOrigin": "${APP_ORIGIN}",
+  "skillDir": "${SKILL_DIR}",
+  "repoRoot": "${ROOT}"
+}
+EOF
+}
+
+cmd_launch() {
+  ensure_dirs
+  write_meta
+  printf 'launch ok\n'
+  printf 'runId=%s\n' "${RUN_ID}"
+  printf 'workRoot=%s\n' "${WORK_ROOT}"
+  printf 'evidenceDir=%s\n' "${EVIDENCE_DIR}"
+  printf 'profileDir=%s\n' "${PROFILE_DIR}"
+  printf 'marketing=%s\n' "${MARKETING_ORIGIN}"
+  printf 'Ready when doctor exits 0.\n'
+}
+
+require_http_200_body() {
+  local url="$1"
+  local expect_substr="${2:-}"
+  local tmp
+  tmp="$(mktemp)"
+  local code
+  code="$(curl -sL --max-time 30 -o "${tmp}" -w '%{http_code}' "${url}" || true)"
+  if [[ "${code}" != "200" ]]; then
+    echo "doctor fail: ${url} HTTP ${code}" >&2
+    rm -f "${tmp}"
+    return 1
+  fi
+  if [[ -n "${expect_substr}" ]] && ! grep -a -q -F "${expect_substr}" "${tmp}"; then
+    echo "doctor fail: ${url} missing expected body marker: ${expect_substr}" >&2
+    rm -f "${tmp}"
+    return 1
+  fi
+  rm -f "${tmp}"
+}
+
+cmd_doctor() {
+  ensure_dirs
+  write_meta
+  local report="${EVIDENCE_DIR}/doctor.txt"
+  {
+    echo "verify-openconnector doctor"
+    echo "runId=${RUN_ID}"
+    echo "marketing=${MARKETING_ORIGIN}"
+    echo "api=${API_ORIGIN}"
+    echo "app=${APP_ORIGIN}"
+    echo
+  } >"${report}"
+
+  require_http_200_body "${MARKETING_ORIGIN}/" "Open Connector" | tee -a "${report}"
+  require_http_200_body "${MARKETING_ORIGIN}/integrations" "Search toolkits" | tee -a "${report}"
+  require_http_200_body "${MARKETING_ORIGIN}/docs" "Open Connector" | tee -a "${report}"
+  require_http_200_body "${MARKETING_ORIGIN}/pricing" "Self-host" | tee -a "${report}"
+  require_http_200_body "${MARKETING_ORIGIN}/enterprise" "Enterprise" | tee -a "${report}"
+
+  local api_body
+  api_body="$(curl -sL --max-time 30 "${API_ORIGIN}/" || true)"
+  if [[ "${api_body}" != "OK" ]]; then
+    echo "doctor fail: ${API_ORIGIN}/ expected body OK, got: ${api_body}" | tee -a "${report}" >&2
+    return 1
+  fi
+  echo "api status OK" | tee -a "${report}"
+
+  local spec_tmp
+  spec_tmp="$(mktemp)"
+  local spec_code
+  spec_code="$(curl -sL --max-time 30 -o "${spec_tmp}" -w '%{http_code}' "${API_ORIGIN}/api/v1/spec.json" || true)"
+  if [[ "${spec_code}" != "200" ]]; then
+    echo "doctor fail: OpenAPI HTTP ${spec_code}" | tee -a "${report}" >&2
+    rm -f "${spec_tmp}"
+    return 1
+  fi
+  if ! grep -a -q -F 'Open Connector Native API' "${spec_tmp}"; then
+    echo "doctor fail: OpenAPI missing title" | tee -a "${report}" >&2
+    rm -f "${spec_tmp}"
+    return 1
+  fi
+  rm -f "${spec_tmp}"
+  echo "openapi ok" | tee -a "${report}"
+
+  require_http_200_body "${APP_ORIGIN}/login" "open-connector" | tee -a "${report}"
+
+  echo "doctor ok — hosted commercial surfaces are worth driving" | tee -a "${report}"
+}
+
+absolute_url() {
+  local target="$1"
+  if [[ "${target}" == http://* || "${target}" == https://* ]]; then
+    printf '%s\n' "${target}"
+  else
+    printf '%s%s\n' "${MARKETING_ORIGIN}" "${target}"
+  fi
+}
+
+cmd_fetch() {
+  ensure_dirs
+  local target="${1:?path or url required}"
+  local url
+  url="$(absolute_url "${target}")"
+  local slug
+  slug="$(printf '%s' "${url}" | tr '/:?&=#' '_' | sed 's/__*/_/g' | cut -c1-120)"
+  local body="${EVIDENCE_DIR}/http/${slug}.body"
+  local headers="${EVIDENCE_DIR}/http/${slug}.headers"
+  local code
+  code="$(curl -sL --max-time 45 -D "${headers}" -o "${body}" -w '%{http_code}' "${url}")"
+  printf 'url=%s\ncode=%s\nbody=%s\nheaders=%s\n' "${url}" "${code}" "${body}" "${headers}"
+  [[ "${code}" == "200" || "${code}" == "301" || "${code}" == "302" ]]
+}
+
+cmd_screenshot() {
+  ensure_dirs
+  local url="${1:?url required}"
+  local out="${2:?output path required}"
+  mkdir -p "$(dirname "${out}")"
+  if ! command -v google-chrome >/dev/null 2>&1; then
+    echo "google-chrome not found; cannot screenshot" >&2
+    return 1
+  fi
+  # Disposable profile; headless only — never attach to a shared interactive session.
+  # Bound runtime: heavy marketing/detail pages can hang Chromium indefinitely.
+  local chrome_bin=(google-chrome)
+  if command -v timeout >/dev/null 2>&1; then
+    chrome_bin=(timeout --kill-after=10s 60s google-chrome)
+  fi
+  "${chrome_bin[@]}" \
+    --headless=new \
+    --disable-gpu \
+    --no-sandbox \
+    --virtual-time-budget=8000 \
+    --user-data-dir="${PROFILE_DIR}" \
+    --window-size=1440,1100 \
+    --screenshot="${out}" \
+    "$(absolute_url "${url}")" >/dev/null 2>&1 || {
+      echo "screenshot warn: chrome timed out or failed for ${url}" >&2
+      return 1
+    }
+  printf 'screenshot=%s\n' "${out}"
+  test -s "${out}"
+}
+
+cmd_drive_integrations() {
+  ensure_dirs
+  write_meta
+  local feature_dir="${EVIDENCE_DIR}/features/integrations-browse"
+  mkdir -p "${feature_dir}"
+
+  local list_body="${feature_dir}/integrations.body.html"
+  local detail_body="${feature_dir}/github.body.html"
+  local list_code detail_code
+
+  list_code="$(curl -sL --max-time 45 -o "${list_body}" -w '%{http_code}' "${MARKETING_ORIGIN}/integrations")"
+  detail_code="$(curl -sL --max-time 45 -o "${detail_body}" -w '%{http_code}' "${MARKETING_ORIGIN}/integrations/github")"
+
+  {
+    echo "feature=integrations-browse"
+    echo "list_url=${MARKETING_ORIGIN}/integrations"
+    echo "list_http=${list_code}"
+    echo "detail_url=${MARKETING_ORIGIN}/integrations/github"
+    echo "detail_http=${detail_code}"
+  } >"${feature_dir}/result.txt"
+
+  if [[ "${list_code}" != "200" || "${detail_code}" != "200" ]]; then
+    echo "drive-integrations fail: unexpected HTTP" >&2
+    cat "${feature_dir}/result.txt" >&2
+    return 1
+  fi
+
+  # Observable markers (SSR may inject HTML comments between words).
+  python3 - "${list_body}" "${detail_body}" "${feature_dir}/proof.txt" <<'PY'
+import re, sys
+list_path, detail_path, out_path = sys.argv[1:4]
+
+def load(path: str) -> str:
+    return open(path, "rb").read().replace(b"\x00", b"").decode("utf-8", "replace")
+
+def visible_text(raw: str) -> str:
+    # Drop scripts/styles/comments, then tags, collapse space.
+    raw = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.I)
+    raw = re.sub(r"<style[\s\S]*?</style>", " ", raw, flags=re.I)
+    raw = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    return re.sub(r"\s+", " ", raw)
+
+list_raw = load(list_path)
+detail_raw = load(detail_path)
+list_text = visible_text(list_raw)
+detail_text = visible_text(detail_raw)
+
+checks = {
+    "list.search": "Search toolkits" in list_raw,
+    "list.find_heading": "Find your next integration" in list_text,
+    "list.toolkits_region": 'aria-label="Toolkits"' in list_raw,
+    "detail.github": "GitHub" in detail_text,
+    "detail.for_ai_agents": "for AI agents" in detail_text,
+    "detail.supported_tools": "Supported GitHub tools and triggers" in detail_text,
+}
+missing = [name for name, ok in checks.items() if not ok]
+if missing:
+    print("drive-integrations fail: missing markers: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+
+title = re.search(r"<title[^>]*>(.*?)</title>", detail_raw, re.I | re.S)
+h1s = [
+    re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", re.sub(r"<!--.*?-->", "", m.group(0), flags=re.S))).strip()
+    for m in re.finditer(r"<h1[^>]*>[\s\S]*?</h1>", detail_raw)
+]
+list_title = re.search(r"<title[^>]*>(.*?)</title>", list_raw, re.I | re.S)
+lines = [
+    "integrations-browse proof",
+    f"list.title={(list_title.group(1) if list_title else '')}",
+    f"list.has_search={checks['list.search']}",
+    f"list.has_toolkits_region={checks['list.toolkits_region']}",
+    f"detail.title={(title.group(1) if title else '')}",
+    f"detail.h1={h1s}",
+    f"detail.has_github={checks['detail.github']}",
+    f"detail.supported_tools={checks['detail.supported_tools']}",
+]
+open(out_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+print("\n".join(lines))
+PY
+
+  # Capture screenshots when Chrome is available (catalog page is enough for visual brand proof;
+  # GitHub detail HTML is multi‑MB and often too heavy for reliable headless screenshots).
+  if command -v google-chrome >/dev/null 2>&1; then
+    cmd_screenshot "/integrations" "${feature_dir}/integrations.png" || true
+  fi
+
+  echo "drive-integrations ok"
+  echo "evidence=${feature_dir}"
+}
+
+cmd_cleanup() {
+  # Never delete evidence. Only scratch profile + pid metadata under work root.
+  if [[ -f "${PID_FILE}" ]]; then
+    local pid
+    pid="$(cat "${PID_FILE}" || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${PID_FILE}"
+  fi
+  if [[ -d "${PROFILE_DIR}" ]]; then
+    rm -rf "${PROFILE_DIR}"
+  fi
+  # Remove empty scratch leftovers but keep evidence and run.json.
+  printf 'cleanup ok\nevidence kept at %s\n' "${EVIDENCE_DIR}"
+  if [[ -d "${EVIDENCE_DIR}" ]]; then
+    ls -la "${EVIDENCE_DIR}" || true
+  else
+    echo "warning: evidence dir missing after cleanup" >&2
+    return 1
+  fi
+}
+
+cmd_paths() {
+  write_meta
+  cat "${META_FILE}"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "${cmd}" in
+    launch) cmd_launch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    fetch) cmd_fetch "$@" ;;
+    screenshot) cmd_screenshot "$@" ;;
+    drive-integrations) cmd_drive_integrations "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    paths) cmd_paths "$@" ;;
+    -h|--help|help|"") usage; [[ -n "${cmd}" ]] ;;
+    *) echo "unknown command: ${cmd}" >&2; usage; return 2 ;;
+  esac
+}
+
+main "$@"
